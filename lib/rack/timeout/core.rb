@@ -108,6 +108,7 @@ MSG
 
         if seconds_service_left <= 0 # expire requests that have waited for too long in the queue (as they are assumed to have been dropped by the web server / routing layer at this point)
           RT._set_state! env, :expired
+          # This is a normal error being raised, and we can keep this without danger.
           raise RequestExpiryError.new(env), "Request older than #{info.ms(:timeout)}."
         end
       end
@@ -123,31 +124,22 @@ MSG
 
       heartbeat_event = nil                                 # init var so it's in scope for following proc
       register_state_change = ->(status = :active) {        # updates service time and state; will run every second
-        heartbeat_event.cancel! if status != :active        # if the request is no longer active we should stop updating every second
+        # TODO when do we stop the heartbeat? on completed? TODO double check states - yep, on completed https://github.com/zombocom/rack-timeout/blob/main/doc/request-lifecycle.md
+        heartbeat_event.cancel! if status == :completed        # if the request is no longer active we should stop updating every second
         info.service = fsecs - ts_started_service           # update service time
         RT._set_state! env, status                          # update status
       }
-      heartbeat_event = RT::Scheduler.run_every(1) { register_state_change.call :active }  # start updating every second while active; if log level is debug, this will log every sec
+      # make dynamic because we want to log the timed out status if it changes.
+      status = :active
+      heartbeat_event = RT::Scheduler.run_every(1) { register_state_change.call status }  # start updating every second while active; if log level is debug, this will log every sec
 
       timeout = RT::Scheduler::Timeout.new do |app_thread|  # creates a timeout instance responsible for timing out the request. the given block runs if timed out
+        # does this modify the external status?
+        status = :timed_out
         register_state_change.call :timed_out
-
-        message = +"Request "
-        message << "waited #{info.ms(:wait)}, then " if info.wait
-        message << "ran for longer than #{info.ms(:timeout)} "
-        if term_on_timeout
-          Thread.main['RACK_TIMEOUT_COUNT'] ||= 0
-          Thread.main['RACK_TIMEOUT_COUNT'] += 1
-
-          if Thread.main['RACK_TIMEOUT_COUNT'] >= term_on_timeout
-            message << ", sending SIGTERM to process #{Process.pid}"
-            Process.kill("SIGTERM", Process.pid)
-          else
-            message << ", #{Thread.main['RACK_TIMEOUT_COUNT']}/#{term_on_timeout} timeouts allowed before SIGTERM for process #{Process.pid}"
-          end
-        end
-
-        app_thread.raise(RequestTimeoutException.new(env), message)
+        # NOTE: we have removed the actual raising/timeout of this lib.
+        # TODO: do we want to bring it up just at a higher level timeout?
+        # should we have a log_timeout and a kill_timeout option?
       end
 
       response = timeout.timeout(info.timeout) do           # perform request with timeout
